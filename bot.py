@@ -23,6 +23,7 @@ import io
 import logging
 import os
 import re
+import ssl
 import threading
 import time
 from dataclasses import dataclass, field
@@ -463,6 +464,13 @@ class Bot:
             except Exception:
                 log.exception("Не удалось уведомить о проблеме")
 
+    # ---- threads ------------------------------------ще раза в 30 мин
+            self._last_error_notify = now
+            try:
+                self.tg.send_text(f"⚠️ Проблема с проверкой почты:\n{msg}")
+            except Exception:
+                log.exception("Не удалось уведомить о проблеме")
+
     # ---- threads -------------------------------------------------------
     def timer_loop(self) -> None:
         while not self._stop.is_set():
@@ -554,6 +562,12 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
     cfg = load_config()
+    if not re.fullmatch(r"-?\d+", cfg.tg_chat_id):
+        log.warning(
+            "TG_CHAT_ID='%s' не похож на числовой id — Telegram будет отвечать 400. "
+            "Нужно число из getUpdates (не имя, не @username и не id самого бота).",
+            cfg.tg_chat_id,
+        )
     start_health_server()
     Bot(cfg).run()
 
