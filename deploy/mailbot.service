@@ -1,0 +1,20 @@
+[Unit]
+Description=Read-only mail -> Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mailbot
+WorkingDirectory=/opt/mail-read-bot
+ExecStart=/opt/mail-read-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+# --- защита соседнего VPN-сервиса на 512 МБ VPS ---
+MemoryMax=300M
+MemoryHigh=250M
+CPUQuota=25%
+
+[Install]
+WantedBy=multi-user.target

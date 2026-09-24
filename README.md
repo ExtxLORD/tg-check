@@ -61,25 +61,28 @@ python bot.py
 
 Логи пишутся в консоль (пароль в логи не попадает).
 
-## Автозапуск (по желанию)
+## Деплой на свой VPS (рекомендуется) 
 
-Самый простой вариант — `screen`/`tmux`, либо systemd-юнит / планировщик Windows. Пример (Linux):
+Боту не нужны входящие порты — только исходящие (Telegram :443, IMAP :993). На VPS с уже работающим VPN ничего в фаерволе менять не нужно. Ресурсы: ~50–80 МБ RAM, ≈0% CPU.
 
-```ini
-# /etc/systemd/system/mail-read-bot.service
-[Unit]
-Description=Read-only mail to Telegram bot
-After=network-online.target
+От рута на сервере (Ubuntu/Debian):
 
-[Service]
-WorkingDirectory=/path/to/mail_read_bot
-ExecStart=/path/to/mail_read_bot/.venv/bin/python bot.py
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
+```bash
+git clone https://github.com/ExtxLORD/tg-check.git /opt/mail-read-bot
+cd /opt/mail-read-bot
+bash deploy/install.sh
 ```
+
+Скрипт создаст изолированного пользователя `mailbot`, venv, `.env` (шаблон — **заполните вручную** пароль почты и токены) и включит systemd-юнит `mailbot.service` с автозапуском.
+
+**Важно для VPS на 512 МБ:** поставьте в `.env` `MAX_ATTACHMENT_MB=25`. Юнит имеет лимит `MemoryMax=300M` / `CPUQuota=25%` — бот физически не сможет задеть соседний VPN-сервис.
+
+```bash
+journalctl -u mailbot -f   # логи
+systemctl restart mailbot  # перезапуск
+```
+
+Автообновление при пуше в GitHub: `cd /opt/mail-read-bot && git pull && systemctl restart mailbot`.
 
 ## Важно
 
