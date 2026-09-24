@@ -27,7 +27,7 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email import policy
 from email.message import Message
 from email.utils import parseaddr, parsedate_to_datetime
@@ -367,6 +367,9 @@ class Telegram:
 _RU_MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня",
               "июля", "августа", "сентября", "октября", "ноября", "декабря")
 
+# Москва, UTC+3 (без перехода на летнее время)
+_MSK = timezone(timedelta(hours=3))
+
 
 def h(text: str) -> str:
     """Экранирование для Telegram HTML."""
@@ -374,13 +377,16 @@ def h(text: str) -> str:
 
 
 def format_date(raw: str) -> str:
-    """'Thu, 24 Sep 2026 13:59:21 +0300' -> '24 сентября 2026, 13:59'."""
+    """'Thu, 24 Sep 2026 10:00:00 +0000' -> '24 сентября 2026, 13:00' (МСК)."""
     raw = (raw or "").strip()
     if not raw:
         return "—"
     try:
         dt = parsedate_to_datetime(raw)
-        return f"{dt.day} {_RU_MONTHS[dt.month - 1]} {dt.year}, {dt.strftime('%H:%M')}"
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(_MSK)
+        return f"{dt.day} {_RU_MONTHS[dt.month - 1]} {dt.year}, {dt.strftime('%H:%M')} (МСК)"
     except Exception:
         return raw
 
@@ -431,7 +437,7 @@ class Bot:
             try:
                 client = imap_connect(self.cfg)
                 mails = imap_fetch_unseen(client)
-                self.last_check = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.last_check = datetime.now(_MSK).strftime("%Y-%m-%d %H:%M:%S")
 
                 pending = [m for m in mails if m.uid not in self._processed]
                 skipped_cap = max(0, len(pending) - self.cfg.max_per_check)
@@ -584,7 +590,7 @@ class Bot:
                 elif text == "/status":
                     self.tg.send_text(
                         "📊 <b>Статус бота</b>\n\n"
-                        f"⏱ Последняя проверка: <i>{self.last_check}</i>\n"
+                        f"⏱ Последняя проверка (МСК): <i>{self.last_check}</i>\n"
                         f"📬 Результат: {h(str(self.last_result))}\n"
                         f"📤 Всего отправлено писем: <b>{self.total_delivered}</b>\n"
                         f"🔁 Интервал проверки: <b>{self.cfg.check_interval}</b> с",
