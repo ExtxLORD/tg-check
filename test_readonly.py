@@ -35,7 +35,8 @@ FORBIDDEN = {
 for name, pat in FORBIDDEN.items():
     check(f"code has no {name}", not re.search(pat, code))
 
-check("select readonly=True", "readonly=True" in code)
+# select должен быть read-write: иначе сервер запретит STORE +\Seen после доставки
+check("no readonly select (would block \\Seen)", "readonly=True" not in code)
 check("BODY.PEEK used", "BODY.PEEK[]" in code)
 n_store = len(re.findall(r"uid\(\s*['\"]store['\"]", code))
 check("exactly 1 uid(store) path", n_store == 1, f"found {n_store}")

@@ -232,70 +232,76 @@ def _part_text(part: Message) -> str:
 # ------------------------------------------------------------ IMAP layer
 # READ-ONLY: search + peek-fetch. The single write op is mark_seen().
 
-def imap_connect(cfg: Config) -> imaplib.IMAP4_SSL:
+def imap_connect(cfg: Config, attempts: int = 2) -> imaplib.IMAP4_SSL:
+    """Одно соединение на проверку: fetch + mark_seen на одном клиенте.
+
+    SELECT открывается на запись — иначе сервер запретит ЕДИНСТВЕННУЮ
+    операцию записи в боте (STORE +FLAGS \\Seen после доставки).
+    Чтение при этом остаётся без побочных эффектов: BODY.PEEK[] не ставит \\Seen.
+    """
     ctx = ssl.create_default_context()
-    client = imaplib.IMAP4_SSL(cfg.imap_host, cfg.imap_port, ssl_context=ctx, timeout=30)
-    client.login(cfg.mail_login, cfg.mail_password)
-    client.select(cfg.imap_folder, readonly=True)   # EXAMINE-like: no accidental changes
-    return client
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            client = imaplib.IMAP4_SSL(cfg.imap_host, cfg.imap_port, ssl_context=ctx, timeout=30)
+            client.login(cfg.mail_login, cfg.mail_password)
+            client.select(cfg.imap_folder)
+            return client
+        except Exception as exc:  # noqa: BLE001 — любой сбой сети/логина повторяем один раз
+            last_exc = exc
+            if attempt + 1 < attempts:
+                log.warning("IMAP connect failed (%s), повтор через 4 с…", exc)
+                time.sleep(4)
+    raise last_exc if last_exc else RuntimeError("IMAP connect failed")
 
 
-def imap_fetch_unseen(cfg: Config) -> list[ParsedMail]:
-    client = imap_connect(cfg)
+def imap_release(client: imaplib.IMAP4_SSL | None) -> None:
+    if client is None:
+        return
     try:
-        typ, data = client.uid("search", None, "UNSEEN")
-        if typ != "OK":
-            raise RuntimeError(f"IMAP search failed: {typ}")
-        uids = [u.decode() for u in (data[0] or b"").split() if u]
-        log.info("UNSEEN: %d писем (uids=%s)", len(uids), ",".join(uids[:20]) + ("…" if len(uids) > 20 else ""))
-
-        mails: list[ParsedMail] = []
-        for uid in uids:
-            # BODY.PEEK[] — чтение без побочного эффекта \Seen
-            typ, data = client.uid("fetch", uid, "(BODY.PEEK[])")
-            if typ != "OK" or not data or data[0] is None:
-                log.warning("Не удалось скачать uid=%s", uid)
-                continue
-            raw = data[0][1] if isinstance(data[0], tuple) else b""
-            if not raw:
-                # смешанные форматы ответа
-                for item in data:
-                    if isinstance(item, tuple) and len(item) > 1:
-                        raw = item[1]
-                        break
-            if not raw:
-                continue
-            try:
-                mails.append(parse_message(raw, uid))
-            except Exception:
-                log.exception("Ошибка разбора письма uid=%s", uid)
-        return mails
-    finally:
-        try:
-            client.close()
-        except Exception:
-            pass
-        try:
-            client.logout()
-        except Exception:
-            pass
-
-
-def imap_mark_seen(cfg: Config, uid: str) -> bool:
-    """The ONLY write operation of the whole bot. Called only after successful delivery."""
-    client = imap_connect(cfg)
+        client.close()
+    except Exception:
+        pass
     try:
-        typ, _ = client.uid("store", uid, "+FLAGS", r"(\Seen)")
-        return typ == "OK"
-    finally:
+        client.logout()
+    except Exception:
+        pass
+
+
+def imap_fetch_unseen(client: imaplib.IMAP4_SSL) -> list[ParsedMail]:
+    typ, data = client.uid("search", None, "UNSEEN")
+    if typ != "OK":
+        raise RuntimeError(f"IMAP search failed: {typ}")
+    uids = [u.decode() for u in (data[0] or b"").split() if u]
+    log.info("UNSEEN: %d писем (uids=%s)", len(uids),
+             ",".join(uids[:20]) + ("…" if len(uids) > 20 else ""))
+
+    mails: list[ParsedMail] = []
+    for uid in uids:
+        # BODY.PEEK[] — чтение без побочного эффекта \Seen
+        typ, data = client.uid("fetch", uid, "(BODY.PEEK[])")
+        if typ != "OK" or not data or data[0] is None:
+            log.warning("Не удалось скачать uid=%s", uid)
+            continue
+        raw = data[0][1] if isinstance(data[0], tuple) else b""
+        if not raw:
+            for item in data:
+                if isinstance(item, tuple) and len(item) > 1:
+                    raw = item[1]
+                    break
+        if not raw:
+            continue
         try:
-            client.close()
+            mails.append(parse_message(raw, uid))
         except Exception:
-            pass
-        try:
-            client.logout()
-        except Exception:
-            pass
+            log.exception("Ошибка разбора письма uid=%s", uid)
+    return mails
+
+
+def imap_mark_seen(client: imaplib.IMAP4_SSL, uid: str) -> bool:
+    """Единственная операция записи во всём боте — только после доставки."""
+    typ, _ = client.uid("store", uid, "+FLAGS", r"(\Seen)")
+    return typ == "OK"
 
 
 # --------------------------------------------------------- Telegram layer
@@ -421,44 +427,52 @@ class Bot:
             return
         try:
             log.info("Проверка почты (%s)…", reason)
-            mails = imap_fetch_unseen(self.cfg)
-            self.last_check = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            client = None
+            try:
+                client = imap_connect(self.cfg)
+                mails = imap_fetch_unseen(client)
+                self.last_check = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            pending = [m for m in mails if m.uid not in self._processed]
-            skipped_cap = max(0, len(pending) - self.cfg.max_per_check)
-            if skipped_cap:
-                pending = pending[: self.cfg.max_per_check]
-
-            delivered = 0
-            for mail in pending:
-                try:
-                    self._deliver(mail)
-                    # единственная запись на почте — строго ПОСЛЕ успешной отправки
-                    if imap_mark_seen(self.cfg, mail.uid):
-                        self._processed.add(mail.uid)
-                    else:
-                        log.warning("Не удалось пометить прочитанным uid=%s (повтор в след. цикле)", mail.uid)
-                    delivered += 1
-                    self.total_delivered += 1
-                except Exception:
-                    log.exception("Не удалось доставить uid=%s — остаётся непрочитанным", mail.uid)
-
-            self.last_result = (
-                f"непрочитанных найдено: {len(mails)}, отправлено: {delivered}"
-                + (f", отложено (лимит {self.cfg.max_per_check}/проверку): {skipped_cap}" if skipped_cap else "")
-            )
-            log.info(self.last_result)
-
-            if reason == "manual":
-                text = (
-                    "✅ <b>Проверка завершена</b>\n\n"
-                    f"📬 Непрочитанных найдено: <b>{len(mails)}</b>\n"
-                    f"📤 Отправлено вам: <b>{delivered}</b>"
-                )
+                pending = [m for m in mails if m.uid not in self._processed]
+                skipped_cap = max(0, len(pending) - self.cfg.max_per_check)
                 if skipped_cap:
-                    text += f"\n⏳ Отложено до следующих проверок: {skipped_cap}"
-                text += f"\n\n🔁 Следующая автоматическая проверка: через {self.cfg.check_interval} с"
-                self.tg.send_text(text, html=True)
+                    pending = pending[: self.cfg.max_per_check]
+
+                delivered = 0
+                for mail in pending:
+                    try:
+                        self._deliver(mail)
+                        # ВСЕГДА после успешной отправки — иначе при сбое STORE
+                        # письмо ушло бы повторно каждую проверку (спам)
+                        self._processed.add(mail.uid)
+                        if not imap_mark_seen(client, mail.uid):
+                            log.warning(
+                                "STORE \\Seen не прошёл uid=%s — повторно отправлено не будет",
+                                mail.uid,
+                            )
+                        delivered += 1
+                        self.total_delivered += 1
+                    except Exception:
+                        log.exception("Не удалось доставить uid=%s — остаётся непрочитанным", mail.uid)
+
+                self.last_result = (
+                    f"непрочитанных найдено: {len(mails)}, отправлено: {delivered}"
+                    + (f", отложено (лимит {self.cfg.max_per_check}/проверку): {skipped_cap}" if skipped_cap else "")
+                )
+                log.info(self.last_result)
+
+                if reason == "manual":
+                    text = (
+                        "✅ <b>Проверка завершена</b>\n\n"
+                        f"📬 Непрочитанных найдено: <b>{len(mails)}</b>\n"
+                        f"📤 Отправлено вам: <b>{delivered}</b>"
+                    )
+                    if skipped_cap:
+                        text += f"\n⏳ Отложено до следующих проверок: {skipped_cap}"
+                    text += f"\n\n🔁 Следующая автоматическая проверка: через {self.cfg.check_interval} с"
+                    self.tg.send_text(text, html=True)
+            finally:
+                imap_release(client)
         except imaplib.IMAP4.error as exc:
             self._handle_error(f"IMAP ошибка: {exc}")
         except Exception as exc:
