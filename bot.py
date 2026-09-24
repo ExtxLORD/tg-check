@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from email import policy
 from email.message import Message
+from email.utils import parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -313,7 +314,16 @@ class Telegram:
             raise RuntimeError(f"Telegram API {method} error: {payload}")
         return payload["result"]
 
-    def send_text(self, text: str) -> None:
+    def send_text(self, text: str, html: bool = False) -> None:
+        # HTML-сообщения не режем (можно разорвать тег) — только если влезают целиком
+        if html and len(text) <= TG_MSG_LIMIT:
+            self._post("sendMessage", data={
+                "chat_id": self.cfg.tg_chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": "true",
+            })
+            return
         for chunk in split_text(text, TG_MSG_LIMIT):
             self._post("sendMessage", data={
                 "chat_id": self.cfg.tg_chat_id,
@@ -346,6 +356,27 @@ class Telegram:
             log.warning("getUpdates: %s", exc)
             time.sleep(3)
             return []
+
+
+_RU_MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня",
+              "июля", "августа", "сентября", "октября", "ноября", "декабря")
+
+
+def h(text: str) -> str:
+    """Экранирование для Telegram HTML."""
+    return html_mod.escape(str(text), quote=False)
+
+
+def format_date(raw: str) -> str:
+    """'Thu, 24 Sep 2026 13:59:21 +0300' -> '24 сентября 2026, 13:59'."""
+    raw = (raw or "").strip()
+    if not raw:
+        return "—"
+    try:
+        dt = parsedate_to_datetime(raw)
+        return f"{dt.day} {_RU_MONTHS[dt.month - 1]} {dt.year}, {dt.strftime('%H:%M')}"
+    except Exception:
+        return raw
 
 
 def split_text(text: str, limit: int) -> list[str]:
@@ -418,12 +449,16 @@ class Bot:
             )
             log.info(self.last_result)
 
-            if delivered or skipped_cap:
-                note = ""
+            if reason == "manual":
+                text = (
+                    "✅ <b>Проверка завершена</b>\n\n"
+                    f"📬 Непрочитанных найдено: <b>{len(mails)}</b>\n"
+                    f"📤 Отправлено вам: <b>{delivered}</b>"
+                )
                 if skipped_cap:
-                    note = f"\n\n⚠️ Осталось непрочитанных: {skipped_cap}+ — они будут в следующих проверках (лимит {self.cfg.max_per_check} за раз)."
-                if reason == "manual":
-                    self.tg.send_text(f"✅ Проверка по команде: {self.last_result}{note}")
+                    text += f"\n⏳ Отложено до следующих проверок: {skipped_cap}"
+                text += f"\n\n🔁 Следующая автоматическая проверка: через {self.cfg.check_interval} с"
+                self.tg.send_text(text, html=True)
         except imaplib.IMAP4.error as exc:
             self._handle_error(f"IMAP ошибка: {exc}")
         except Exception as exc:
@@ -432,23 +467,51 @@ class Bot:
             self._lock.release()
 
     def _deliver(self, mail: ParsedMail) -> None:
+        name, addr = parseaddr(mail.sender or "")
+        name = (name or addr or "(нет имени)").strip()
+        addr = (addr or "").strip()
+        subj = mail.subject or "(без темы)"
+        date = format_date(mail.date)
+
+        att_names = [a.filename for a in mail.attachments]
+        att_line_html = ""
+        att_line_plain = ""
+        if att_names:
+            shown = ", ".join(att_names[:8])
+            more = f" …и ещё {len(att_names) - 8}" if len(att_names) > 8 else ""
+            att_line_html = f"\n\n📎 <b>Вложения ({len(att_names)}):</b> {h(shown + more)}"
+            att_line_plain = f"\n\n📎 Вложения ({len(att_names)}): {shown}{more}"
+
+        sender_html = h(name) + (f" &lt;{h(addr)}&gt;" if addr else "")
         header = (
-            f"📩 НОВОЕ НЕПРОЧИТАННОЕ ПИСЬМО\n"
-            f"От: {mail.sender}\n"
-            f"Тема: {mail.subject}\n"
-            f"Дата: {mail.date}\n"
-            f"UID: {mail.uid}\n"
-            f"{'—' * 20}\n"
+            "📬 <b>Новое непрочитанное письмо</b>\n\n"
+            f"<b>👤 От:</b> {sender_html}\n"
+            f"<b>📝 Тема:</b> {h(subj)}\n"
+            f"<b>📅 Дата:</b> {h(date)}\n"
+            "━━━━━━━━━━━━━━━━━━\n"
         )
-        body = mail.body if mail.body else "(письмо без текстовой части)"
-        self.tg.send_text(header + body)
+        body = mail.body or "<i>(письмо без текстовой части)</i>"
+        combined = header + h(body) + att_line_html
+
+        if len(combined) <= TG_MSG_LIMIT - 200:
+            # короткое письмо — одним красивым HTML-сообщением
+            self.tg.send_text(combined, html=True)
+        else:
+            # длинное — шапка HTML, затем текст обычными частями (без разрыва тегов)
+            self.tg.send_text(header + "⬇️ <i>Текст длинный — читайте ниже</i>", html=True)
+            plain_body = mail.body or "(письмо без текстовой части)"
+            for chunk in split_text(plain_body, TG_MSG_LIMIT):
+                self.tg.send_text(chunk)
+            if att_line_plain:
+                self.tg.send_text(att_line_plain.strip())
 
         max_bytes = self.cfg.max_attachment_mb * 1024 * 1024
         for att in mail.attachments:
             if len(att.data) > max_bytes:
                 self.tg.send_text(
-                    f"⚠️ Вложение «{att.filename}» ({len(att.data) / 1048576:.1f} МБ) "
-                    f"не отправлено: превышает лимит {self.cfg.max_attachment_mb} МБ."
+                    f"⚠️ Вложение «{h(att.filename)}» "
+                    f"({len(att.data) / 1048576:.1f} МБ) не отправлено — "
+                    f"лимит {self.cfg.max_attachment_mb} МБ."
                 )
                 continue
             self.tg.send_document(att.filename, att.data, att.mime)
@@ -481,8 +544,11 @@ class Bot:
 
     def telegram_loop(self) -> None:
         help_text = (
-            "🤖 Бот почты (read-only).\n"
-            "Команды:\n"
+            "🤖 <b>Mail Read Bot</b> <i>(read-only)</i>\n\n"
+            "Бот только читает непрочитанные письма\n"
+            "и пересылает их в этот чат. Ничего не отправляет\n"
+            "и не удаляет на почте.\n\n"
+            "🧩 <b>Команды:</b>\n"
             "/check — проверить почту сейчас\n"
             "/status — статус последней проверки\n"
             "/help — эта справка"
@@ -497,19 +563,21 @@ class Bot:
                     log.info("Игнорирую сообщение из чата %s (не мой)", chat_id)
                     continue
                 if text in ("/start", "/help"):
-                    self.tg.send_text(help_text)
+                    self.tg.send_text(help_text, html=True)
                 elif text == "/check":
-                    self.tg.send_text("🔍 Проверяю почту…")
+                    self.tg.send_text("🔍 <b>Проверяю почту…</b>", html=True)
                     self.check_mail("manual")
                 elif text == "/status":
                     self.tg.send_text(
-                        f"⏱ Последняя проверка: {self.last_check}\n"
-                        f"Результат: {self.last_result}\n"
-                        f"Всего отправлено писем: {self.total_delivered}\n"
-                        f"Интервал: {self.cfg.check_interval} с"
+                        "📊 <b>Статус бота</b>\n\n"
+                        f"⏱ Последняя проверка: <i>{self.last_check}</i>\n"
+                        f"📬 Результат: {h(str(self.last_result))}\n"
+                        f"📤 Всего отправлено писем: <b>{self.total_delivered}</b>\n"
+                        f"🔁 Интервал проверки: <b>{self.cfg.check_interval}</b> с",
+                        html=True,
                     )
                 elif text:
-                    self.tg.send_text("Неизвестная команда. /help — список команд.")
+                    self.tg.send_text("❓ Неизвестная команда. Нажмите /help — список команд.")
 
     def run(self) -> None:
         # smoke-check Telegram before anything else
