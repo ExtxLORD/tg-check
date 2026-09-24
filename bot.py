@@ -522,6 +522,31 @@ class Bot:
             self._stop.set()
 
 
+def start_health_server() -> None:
+    """Мини HTTP-сервер для health-check'ов PaaS (Render/Koyeb выставляют $PORT).
+    Боту он не нужен — включается только если платформа задала PORT."""
+    port = os.environ.get("PORT", "").strip()
+    if not port:
+        return
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args) -> None:  # тишина в логах
+            pass
+
+    server = ThreadingHTTPServer(("0.0.0.0", int(port)), _HealthHandler)
+    threading.Thread(target=server.serve_forever, name="health", daemon=True).start()
+    log.info("Health-check сервер слушает :%s", port)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -529,6 +554,7 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
     cfg = load_config()
+    start_health_server()
     Bot(cfg).run()
 
 
