@@ -51,7 +51,8 @@ check(
 
 tg_posts = set(re.findall(r'_post\(\s*["\'](\w+)["\']', code))
 tg_posts.add("getUpdates")  # called via self.tg.get_updates -> requests.get
-allowed_tg = {"sendMessage", "sendDocument", "getMe", "getUpdates"}
+# setMyCommands — только регистрация меню команд, ничего никому не отправляет
+allowed_tg = {"sendMessage", "sendDocument", "getMe", "getUpdates", "setMyCommands"}
 check("Telegram methods limited to read-out", tg_posts <= allowed_tg, str(tg_posts))
 
 # no other chat allowed: sendMessage/sendDocument always use cfg.tg_chat_id
@@ -100,8 +101,58 @@ _bot.tg._post = lambda *a, **k: _sent.append(a) or {"ok": True}
 _bot.tg.send_text("")
 _bot.tg.send_text("   \n  ")
 check("send_text: пустой/пробельный текст не отправляется", not _sent)
+
+# MAX_ATTACHMENT_MB не может быть больше лимита Bot API (50 МБ)
+import os as _os2
+import importlib as _il
+_os2.environ["MAX_ATTACHMENT_MB"] = "999"
+_i = _il.reload(b)
+_os2.environ.pop("MAX_ATTACHMENT_MB", None)
+check("config: MAX_ATTACHMENT_MB зажат до 50 МБ", _i.TG_DOC_LIMIT_BYTES // (1024 * 1024) == 50)
 _bot.tg.send_text("ок")
 check("send_text: обычный текст отправляется", len(_sent) == 1)
+
+# ---------------------------------------------------------------------------
+# Кнопки меню: каждая кнопка обязана распознаваться как команда, иначе нажатие
+# превратится в «❓ Не понял» вместо действия.
+BUTTON_ACTIONS = {"check", "status", "help"}
+for _row in b.MAIN_KEYBOARD["keyboard"]:
+    for _btn in _row:
+        _label = _btn["text"]
+        _act = b.resolve_command(_label)
+        check(f"кнопка {_label!r} -> действие", _act in BUTTON_ACTIONS, f"получилось {_act!r}")
+
+for _alias, _want in {
+    "/start": "help", "/help": "help", "/check": "check", "/status": "status",
+    "🔍 Проверить сейчас": "check", "проверить": "check",
+    "📊 Статус": "status", "  STATUS  ": "status", "❓ Помощь": "help",
+    "абракадабра": None, "": None,
+}.items():
+    check(f"resolve_command({_alias!r})", b.resolve_command(_alias) == _want, f"= {b.resolve_command(_alias)!r}")
+
+check("keyboard: resize + persistent",
+      b.MAIN_KEYBOARD["resize_keyboard"] is True and b.MAIN_KEYBOARD["is_persistent"] is True)
+check("commands menu: описания непустые",
+      all(c["command"] and c["description"] for c in b.BOT_COMMANDS))
+
+# клавиатура реально уезжает в Telegram (первый чанк, ровно один раз)
+_kb = b.Bot(b.Config(imap_host="h", imap_port=993, mail_login="l", mail_password="p",
+                     tg_token="t", tg_chat_id="1", check_interval=300, imap_folder="INBOX",
+                     max_per_check=25, max_attachment_mb=50))
+_posts = []
+_kb.tg._post = lambda method, **kw: _posts.append((method, kw.get("data", {}))) or {"ok": True}
+_kb.tg.send_text("привет", html=True, keyboard=True)
+check("send_text: клавиатура приложена", "reply_markup" in _posts[0][1] and "Проверить сейчас" in _posts[0][1]["reply_markup"])
+_posts.clear()
+_kb.tg.send_text("длинный " * 900, keyboard=True)          # разобьётся на части
+_with_kb = [d for _, d in _posts if "reply_markup" in d]
+check("send_text: клавиатура только на первом чанке", len(_posts) > 1 and len(_with_kb) == 1,
+      f"чанков {len(_posts)}, с клавиатурой {len(_with_kb)}")
+_posts.clear()
+_kb.tg.set_commands()
+check("set_commands: шлёт setMyCommands с меню",
+      _posts and _posts[0][0] == "setMyCommands" and "check" in _posts[0][1]["commands"],
+      str(_posts[0][0]) if _posts else "пусто")
 
 # Регрессия: задублированный блок в _handle_error слал ДВА уведомления об одной ошибке
 _sent.clear()
@@ -221,6 +272,20 @@ check("format_uptime", b.format_uptime(59) == "59 с" and "мин" in b.format_u
       and "ч" in b.format_uptime(7300) and "д" in b.format_uptime(90000))
 
 b.log.removeHandler(_cap)
+
+# ---------------------------------------------------------------------------
+# История доставленных uid не растёт бесконечно
+_h = b.Bot(b.Config(imap_host="h", imap_port=993, mail_login="l", mail_password="p",
+                    tg_token="t", tg_chat_id="1", check_interval=300, imap_folder="INBOX",
+                    max_per_check=25, max_attachment_mb=50))
+_h._processed_max = 10
+for _i in range(25):
+    _h._mark_processed(f"uid{_i}")
+check("uid-история: set ограничен капом", len(_h._processed) == 10, f"{len(_h._processed)}")
+check("uid-история: вытесняются самые старые",
+      "uid24" in _h._processed and "uid0" not in _h._processed)
+_h._mark_processed("uid24")   # повторный вызов не должен раздувать очередь
+check("uid-история: дубликат не добавляется", len(_h._processed_order) == 10)
 
 # ---------------------------------------------------------------------------
 # Автопауза при повторных сбоях IMAP: не «долбить» почтовый сервер

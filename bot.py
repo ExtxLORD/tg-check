@@ -29,6 +29,7 @@ import socket
 import ssl
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email import policy
@@ -43,6 +44,47 @@ log = logging.getLogger("mailbot")
 
 TG_MSG_LIMIT = 4000          # Telegram hard limit is 4096; keep margin
 TG_DOC_LIMIT_BYTES = 50 * 1024 * 1024   # Bot API limit for sendDocument
+
+# Главные кнопки (обычная reply-клавиатура) — всегда видны под полем ввода.
+# Нажатие присылает текст кнопки как обычное сообщение, поэтому текст кнопки
+# обязан распознаваться наравне с командой (см. CMD_ALIASES ниже).
+MAIN_KEYBOARD: dict = {
+    "keyboard": [
+        [{"text": "🔍 Проверить сейчас"}, {"text": "📊 Статус"}],
+        [{"text": "❓ Помощь"}],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+    "input_field_placeholder": "Проверить почту / статус / помощь",
+}
+
+# Меню по кнопке «/» рядом с полем ввода (setMyCommands)
+BOT_COMMANDS = [
+    {"command": "check", "description": "Проверить почту сейчас"},
+    {"command": "status", "description": "Статус, счётчики, пауза"},
+    {"command": "help", "description": "Справка и кнопки"},
+]
+
+_ALIASES = {
+    "/start": "help", "/help": "help", "help": "help",
+    "❓ помощь": "help", "помощь": "help",
+    "/check": "check", "check": "check",
+    "🔍 проверить сейчас": "check", "🔍 проверить": "check", "проверить": "check",
+    "/status": "status", "status": "status",
+    "📊 статус": "status", "статус": "status",
+}
+
+
+def _norm(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+CMD_ALIASES = {_norm(k): v for k, v in _ALIASES.items()}
+
+
+def resolve_command(text: str) -> str | None:
+    """Распознать команду: "/check", "🔍 Проверить сейчас", "статус" -> действие."""
+    return CMD_ALIASES.get(_norm(text))
 
 
 # ----------------------------------------------------------------- config
@@ -64,6 +106,15 @@ class Config:
 def load_config() -> Config:
     load_dotenv()
 
+    def _attachment_mb() -> int:
+        raw = int(opt("MAX_ATTACHMENT_MB", "50"))
+        limit = TG_DOC_LIMIT_BYTES // (1024 * 1024)      # 50 — потолок Bot API
+        if raw > limit:
+            print(f"[config] MAX_ATTACHMENT_MB={raw} > {limit} МБ (лимит Telegram) — "
+                  f"использую {limit}")
+            return limit
+        return max(1, raw)
+
     def req(key: str) -> str:
         val = os.getenv(key, "").strip()
         if not val:
@@ -83,7 +134,7 @@ def load_config() -> Config:
         check_interval=max(30, int(opt("CHECK_INTERVAL", "300"))),
         imap_folder=opt("IMAP_FOLDER", "INBOX"),
         max_per_check=max(1, int(opt("MAX_PER_CHECK", "25"))),
-        max_attachment_mb=max(1, int(opt("MAX_ATTACHMENT_MB", "50"))),
+        max_attachment_mb=_attachment_mb(),
     )
 
 
@@ -346,12 +397,18 @@ class Telegram:
             raise RuntimeError(f"Telegram API {method} error: {payload}")
         return payload["result"]
 
-    def send_text(self, text: str, html: bool = False) -> None:
+    def send_text(self, text: str, html: bool = False, keyboard: bool = False) -> None:
+        """keyboard=True прикрепляет кнопки меню к сообщению (только к первому,
+        если текст разбивается на части)."""
         if not text or not text.strip():
             # Telegram отвечает 400 на пустой текст. Такой вызов сорвал бы
             # доставку письма целиком (и письмо ушло бы повторно) — пропускаем.
             log.warning("send_text: пустой текст, отправка пропущена")
             return
+        markup = (
+            {"reply_markup": json.dumps(MAIN_KEYBOARD, ensure_ascii=False)}
+            if keyboard else {}
+        )
         # HTML-сообщения не режем (можно разорвать тег) — только если влезают целиком
         if html and len(text) <= TG_MSG_LIMIT:
             self._post("sendMessage", data={
@@ -359,14 +416,23 @@ class Telegram:
                 "text": text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": "true",
+                **markup,
             })
             return
-        for chunk in split_text(text, TG_MSG_LIMIT):
+        for i, chunk in enumerate(split_text(text, TG_MSG_LIMIT)):
             self._post("sendMessage", data={
                 "chat_id": self.cfg.tg_chat_id,
                 "text": chunk,
                 "disable_web_page_preview": "true",
+                **(markup if i == 0 else {}),
             })
+
+    def set_commands(self) -> None:
+        """Зарегистрировать меню команд (кнопка «/» рядом с полем ввода)."""
+        self._post("setMyCommands", data={
+            "commands": json.dumps(BOT_COMMANDS, ensure_ascii=False),
+            "scope": json.dumps({"type": "all_private_chats"}),
+        })
 
     def send_document(self, filename: str, data: bytes, mime: str) -> None:
         buf = io.BytesIO(data)
@@ -513,7 +579,12 @@ class Bot:
         self.tg = Telegram(cfg)
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._processed: set[str] = set()      # uids already delivered this run
+        # uid, уже доставленные в этом запуске (если STORE \Seen не прошёл —
+        # чтобы письмо не ушло повторно). История ограничена, иначе set
+        # растёт бесконечно все недели работы процесса.
+        self._processed: set[str] = set()
+        self._processed_order: deque[str] = deque()
+        self._processed_max = 5000
         self.last_check: str = "ещё не было"
         self.last_result: str = "—"
         self.total_delivered = 0
@@ -525,6 +596,15 @@ class Bot:
         self._auto_pause_until = 0.0
 
     # ---- main check ----------------------------------------------------
+    def _mark_processed(self, uid: str) -> None:
+        """Запомнить доставленный uid, вытесняя самые старые (кап 5000)."""
+        if uid in self._processed:
+            return
+        if len(self._processed_order) >= self._processed_max:
+            self._processed.discard(self._processed_order.popleft())
+        self._processed.add(uid)
+        self._processed_order.append(uid)
+
     def check_mail(self, reason: str) -> None:
         if not self._lock.acquire(blocking=False):
             log.info("Проверка уже идёт, пропуск (%s)", reason)
@@ -557,7 +637,7 @@ class Bot:
                         self._deliver(mail)
                         # ВСЕГДА после успешной отправки — иначе при сбое STORE
                         # письмо ушло бы повторно каждую проверку (спам)
-                        self._processed.add(mail.uid)
+                        self._mark_processed(mail.uid)
                         if not imap_mark_seen(client, mail.uid):
                             log.warning(
                                 "STORE \\Seen не прошёл uid=%s — повторно отправлено не будет",
@@ -583,7 +663,7 @@ class Bot:
                     if skipped_cap:
                         text += f"\n⏳ Отложено до следующих проверок: {skipped_cap}"
                     text += f"\n\n🔁 Следующая автоматическая проверка: через {self.cfg.check_interval} с"
-                    self.tg.send_text(text, html=True)
+                    self.tg.send_text(text, html=True, keyboard=True)
             finally:
                 imap_release(client)
         except imaplib.IMAP4.error as exc:
@@ -735,17 +815,21 @@ class Bot:
                 continue
             self.check_mail("timer")
 
-    def telegram_loop(self) -> None:
-        help_text = (
+    def help_text(self) -> str:
+        return (
             "🤖 <b>Mail Read Bot</b> <i>(read-only)</i>\n\n"
-            "Бот только читает непрочитанные письма\n"
-            "и пересылает их в этот чат. Ничего не отправляет\n"
-            "и не удаляет на почте.\n\n"
-            "🧩 <b>Команды:</b>\n"
-            "/check — проверить почту сейчас\n"
-            "/status — статус последней проверки\n"
-            "/help — эта справка"
+            "Бот читает непрочитанные письма и пересылает их в этот чат.\n"
+            "На почте ничего не отправляет и не удаляет — только помечает\n"
+            "прочитанным письмо, которое уже доставлено вам.\n\n"
+            "🧩 <b>Кнопки под полем ввода:</b>\n"
+            "🔍 <b>Проверить сейчас</b> — проверить почту немедленно\n"
+            "📊 <b>Статус</b> — когда была проверка, счётчики, автопауза\n"
+            "❓ <b>Помощь</b> — эта справка\n\n"
+            "Команды <code>/check</code>, <code>/status</code>, <code>/help</code> "
+            "работают так же, как кнопки."
         )
+
+    def telegram_loop(self) -> None:
         log.info("Бот запущен. Интервал: %s с. Ожидание команд…", self.cfg.check_interval)
         while not self._stop.is_set():
             updates = self.tg.get_updates(timeout=30)
@@ -757,15 +841,19 @@ class Bot:
                 if chat_id != self.cfg.tg_chat_id:
                     log.info("Игнорирую сообщение из чата %s (не мой)", chat_id)
                     continue
-                if text in ("/start", "/help"):
-                    self.tg.send_text(help_text, html=True)
-                elif text == "/check":
+                action = resolve_command(text)
+                if action == "help":
+                    self.tg.send_text(self.help_text(), html=True, keyboard=True)
+                elif action == "check":
                     self.tg.send_text("🔍 <b>Проверяю почту…</b>", html=True)
                     self.check_mail("manual")
-                elif text == "/status":
-                    self.tg.send_text(self.status_text(), html=True)
+                elif action == "status":
+                    self.tg.send_text(self.status_text(), html=True, keyboard=True)
                 elif text:
-                    self.tg.send_text("❓ Неизвестная команда. Нажмите /help — список команд.")
+                    self.tg.send_text(
+                        "❓ Не понял. Нажмите кнопку на клавиатуре ниже или отправьте /help.",
+                        keyboard=True,
+                    )
 
     def run(self) -> None:
         # smoke-check Telegram before anything else
@@ -774,6 +862,12 @@ class Bot:
             log.info("Telegram-бот: @%s", me.get("username"))
         except Exception as exc:
             raise SystemExit(f"[tg] Не удалось подключиться к Telegram: {exc}")
+
+        try:
+            self.tg.set_commands()
+            log.info("Меню команд зарегистрировано (setMyCommands)")
+        except Exception as exc:
+            log.warning("Не удалось обновить меню команд: %s", exc)
 
         # При деплое Render поднимает новый контейнер, пока старый ещё ~10 с жив и
         # продолжает опрашивать Telegram и почту. Если начать сразу: экземпляры пинают
