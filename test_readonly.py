@@ -77,6 +77,37 @@ chunks = b.split_text("A" * 9000 + "\n" + "Б" * 9000, 4000)
 check("split_text lossless", "".join(chunks) == "A" * 9000 + "\n" + "Б" * 9000)
 check("split_text within limit", all(len(c) <= 4000 for c in chunks))
 
+# Регрессия: однострочное письмо длиннее лимита давало ПУСТОЙ первый чанк.
+# Telegram отвечает на пустой текст 400-й -> доставка падает -> письмо не
+# помечается \Seen и пересылается каждую проверку (спам-петля).
+for name, sample in {
+    "одна строка 12000": "X" * 12000,
+    "одна строка ровно 2 лимита": "X" * 8000,
+    "текст + длинная строка": "Привет\n" + "Y" * 9000,
+    "строка ровно в лимит": "Z" * 4000,
+}.items():
+    parts = b.split_text(sample, 4000)
+    check(f"split_text: нет пустых чанков ({name})", all(p != "" for p in parts), str([len(p) for p in parts]))
+    check(f"split_text: lossless ({name})", "".join(parts) == sample)
+
+# Пустой/пробельный текст вообще не должен уходить в Telegram (иначе 400 + повтор письма)
+_sent = []
+_bot = b.Bot(b.Config(imap_host="h", imap_port=993, mail_login="l", mail_password="p",
+                      tg_token="t", tg_chat_id="1", check_interval=300, imap_folder="INBOX",
+                      max_per_check=25, max_attachment_mb=50))
+_bot.tg._post = lambda *a, **k: _sent.append(a) or {"ok": True}
+_bot.tg.send_text("")
+_bot.tg.send_text("   \n  ")
+check("send_text: пустой/пробельный текст не отправляется", not _sent)
+_bot.tg.send_text("ок")
+check("send_text: обычный текст отправляется", len(_sent) == 1)
+
+# Регрессия: задублированный блок в _handle_error слал ДВА уведомления об одной ошибке
+_sent.clear()
+_bot.tg.send_text = lambda text, html=False: _sent.append(text)
+_bot._handle_error("сбой")
+check("_handle_error: ровно одно уведомление на ошибку", len(_sent) == 1, f"отправлено {len(_sent)}")
+
 print()
 print("ALL PASSED" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)

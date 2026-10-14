@@ -20,6 +20,7 @@ import email
 import html as html_mod
 import imaplib
 import io
+import json
 import logging
 import os
 import re
@@ -32,7 +33,6 @@ from email import policy
 from email.message import Message
 from email.utils import parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
-from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -314,13 +314,22 @@ class Telegram:
 
     def _post(self, method: str, **kwargs) -> dict:
         resp = requests.post(self.base + method, timeout=120, **kwargs)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            # Тело ответа Telegram — единственное место с причиной ошибки (400/413/…)
+            raise RuntimeError(
+                f"Telegram API {method} HTTP {resp.status_code}: {resp.text[:500]}"
+            )
         payload = resp.json()
         if not payload.get("ok"):
             raise RuntimeError(f"Telegram API {method} error: {payload}")
         return payload["result"]
 
     def send_text(self, text: str, html: bool = False) -> None:
+        if not text or not text.strip():
+            # Telegram отвечает 400 на пустой текст. Такой вызов сорвал бы
+            # доставку письма целиком (и письмо ушло бы повторно) — пропускаем.
+            log.warning("send_text: пустой текст, отправка пропущена")
+            return
         # HTML-сообщения не режем (можно разорвать тег) — только если влезают целиком
         if html and len(text) <= TG_MSG_LIMIT:
             self._post("sendMessage", data={
@@ -348,8 +357,11 @@ class Telegram:
             resp = requests.get(self.base + "getUpdates", params={
                 "offset": self._offset,
                 "timeout": timeout,
-                "allowed_updates": ["message"],
+                # Bot API ожидает JSON-строку, а не повторяющийся параметр
+                "allowed_updates": json.dumps(["message"]),
             }, timeout=timeout + 15)
+            if resp.status_code != 200:
+                log.warning("getUpdates HTTP %s: %s", resp.status_code, resp.text[:300])
             resp.raise_for_status()
             payload = resp.json()
             if not payload.get("ok"):
@@ -392,6 +404,12 @@ def format_date(raw: str) -> str:
 
 
 def split_text(text: str, limit: int) -> list[str]:
+    """Резать текст на части ≤ limit БЕЗ потери символов и без пустых частей.
+
+    Пустой чанк — не мелочь: Telegram отвечает на sendMessage с пустым текстом
+    «400 Bad Request: message text is empty», доставка падает, письмо не
+    помечается \\Seen и уходит повторно при каждой проверке (спам-петля).
+    """
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
@@ -399,7 +417,9 @@ def split_text(text: str, limit: int) -> list[str]:
     size = 0
     for line in text.splitlines(keepends=True):
         if size + len(line) > limit:
-            chunks.append("".join(current))
+            # flush только непустой буфер — иначе получится пустое сообщение
+            if current:
+                chunks.append("".join(current))
             current, size = [], 0
         # very long single line — hard-cut
         while len(line) > limit:
@@ -430,6 +450,12 @@ class Bot:
     def check_mail(self, reason: str) -> None:
         if not self._lock.acquire(blocking=False):
             log.info("Проверка уже идёт, пропуск (%s)", reason)
+            if reason == "manual":
+                # Пользователь ждёт ответа на /check после «Проверяю почту…»
+                try:
+                    self.tg.send_text("⏳ Проверка уже идёт — результат придёт сюда.")
+                except Exception:
+                    log.exception("Не удалось ответить на /check")
             return
         try:
             log.info("Проверка почты (%s)…", reason)
@@ -529,7 +555,7 @@ class Bot:
         for att in mail.attachments:
             if len(att.data) > max_bytes:
                 self.tg.send_text(
-                    f"⚠️ Вложение «{h(att.filename)}» "
+                    f"⚠️ Вложение «{att.filename}» "
                     f"({len(att.data) / 1048576:.1f} МБ) не отправлено — "
                     f"лимит {self.cfg.max_attachment_mb} МБ."
                 )
@@ -541,13 +567,6 @@ class Bot:
         self.last_result = msg
         now = time.time()
         if now - self._last_error_notify > 1800:   # не спамим в чат чаще раза в 30 мин
-            self._last_error_notify = now
-            try:
-                self.tg.send_text(f"⚠️ Проблема с проверкой почты:\n{msg}")
-            except Exception:
-                log.exception("Не удалось уведомить о проблеме")
-
-    # ---- threads ------------------------------------ще раза в 30 мин
             self._last_error_notify = now
             try:
                 self.tg.send_text(f"⚠️ Проблема с проверкой почты:\n{msg}")
