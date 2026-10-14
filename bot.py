@@ -679,29 +679,81 @@ class Bot:
             self._stop.set()
 
 
-def start_health_server() -> None:
+def start_health_server(cfg: Config | None = None) -> None:
     """Мини HTTP-сервер для health-check'ов PaaS (Render/Koyeb выставляют $PORT).
-    Боту он не нужен — включается только если платформа задала PORT."""
+    Боту он не нужен — включается только если платформа задала PORT.
+
+    Дополнительно отдаёт /diag: проверка DNS/TCP/TLS до IMAP-сервера С ЭТОГО
+    хостинга — единственный честный способ узнать, дотягивается ли PaaS до
+    корпоративной почты, вместо гадания по таймаутам в логах.
+    Если задана переменная DIAG_KEY, /diag требует ?key=<значение>.
+    """
     port = os.environ.get("PORT", "").strip()
     if not port:
         return
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlsplit
+
+    diag_key = os.environ.get("DIAG_KEY", "").strip()
+
+    def imap_reachability() -> str:
+        import socket
+
+        host = cfg.imap_host if cfg else "(IMAP_HOST не задан)"
+        imap_port = cfg.imap_port if cfg else 993
+        lines = [f"Хост: {host}:{imap_port}"]
+        t0 = time.time()
+        try:
+            infos = socket.getaddrinfo(host, imap_port, type=socket.SOCK_STREAM)
+        except Exception as exc:
+            lines.append(f"DNS: FAIL за {time.time() - t0:.1f} с — {type(exc).__name__}: {exc}")
+            return "\n".join(lines)
+        addrs = sorted({info[4][0] for info in infos})
+        lines.append(f"DNS: OK за {time.time() - t0:.1f} с -> {', '.join(addrs)}")
+        for addr in addrs:
+            t0 = time.time()
+            try:
+                with socket.create_connection((addr, imap_port), timeout=10) as sock:
+                    try:
+                        ctx = ssl.create_default_context()
+                        with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                            lines.append(
+                                f"TCP+TLS {addr}:{imap_port}: OK за {time.time() - t0:.1f} с "
+                                f"({tls.version()}) — почта доступна с этого хостинга"
+                            )
+                    except Exception as exc:
+                        lines.append(f"TCP {addr}:{imap_port}: порт открыт, TLS FAIL — {exc}")
+            except Exception as exc:
+                lines.append(
+                    f"TCP {addr}:{imap_port}: FAIL за {time.time() - t0:.1f} с — "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        return "\n".join(lines)
 
     class _HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
-            body = b"ok"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
+        def _send(self, code: int, body: bytes) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802
+            parts = urlsplit(self.path)
+            if parts.path.rstrip("/") == "/diag":
+                if diag_key and parse_qs(parts.query).get("key", [""])[0] != diag_key:
+                    self._send(403, b"forbidden: otkroite /diag?key=DIAG_KEY")
+                    return
+                self._send(200, imap_reachability().encode("utf-8"))
+                return
+            self._send(200, b"ok")
 
         def log_message(self, *args) -> None:  # тишина в логах
             pass
 
     server = ThreadingHTTPServer(("0.0.0.0", int(port)), _HealthHandler)
     threading.Thread(target=server.serve_forever, name="health", daemon=True).start()
-    log.info("Health-check сервер слушает :%s", port)
+    log.info("Health-check сервер слушает :%s (диагностика почты: /diag)", port)
 
 
 def main() -> None:
@@ -717,7 +769,7 @@ def main() -> None:
             "Нужно число из getUpdates (не имя, не @username и не id самого бота).",
             cfg.tg_chat_id,
         )
-    start_health_server()
+    start_health_server(cfg)
     Bot(cfg).run()
 
 

@@ -178,6 +178,26 @@ check("409: понятное сообщение про второй экземп
 check("409: троттлинг (одно сообщение на окно)", len(_conflict_logs) == 1, f"сообщений: {len(_conflict_logs)}")
 check("логи без токена", all(_TOKEN not in m for m in _cap.msgs), str([m[:60] for m in _cap.msgs]))
 
+# ---------------------------------------------------------------------------
+# /diag — проверка доступности IMAP с самого хостинга (диагностика на PaaS)
+import os as _os
+import urllib.request as _url
+
+_os.environ["PORT"] = "18099"
+_diag_cfg = b.Config(imap_host="localhost", imap_port=1, mail_login="l", mail_password="p",
+                     tg_token="t", tg_chat_id="1", check_interval=300, imap_folder="INBOX",
+                     max_per_check=25, max_attachment_mb=50)
+try:
+    b.start_health_server(_diag_cfg)
+    _root_body = _url.urlopen("http://127.0.0.1:18099/", timeout=10).read().decode()
+    _diag_body = _url.urlopen("http://127.0.0.1:18099/diag", timeout=30).read().decode()
+finally:
+    _os.environ.pop("PORT", None)
+
+check("health: / отвечает ok", _root_body == "ok", _root_body[:30])
+check("diag: показывает DNS и результат TCP", "DNS:" in _diag_body and "TCP" in _diag_body)
+check("diag: закрытый порт виден как FAIL", "FAIL" in _diag_body, _diag_body.replace("\n", " | ")[:110])
+
 print()
 print("ALL PASSED" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)
