@@ -311,9 +311,27 @@ class Telegram:
         self.cfg = cfg
         self.base = f"https://api.telegram.org/bot{cfg.tg_token}/"
         self._offset = 0
+        self._last_conflict_warn = 0.0
+        self._last_net_warn = 0.0
+
+    def _redact(self, text: str) -> str:
+        """Вычистить токен из текста перед записью в лог.
+
+        requests подставляет полный URL (а в нём лежит токен) в текст своих
+        исключений — из-за этого токен уже утекал в логи PaaS. Любую строку,
+        которая может содержать URL Bot API, пропускаем через этот фильтр.
+        """
+        token = self.cfg.tg_token
+        return text.replace(token, "***") if token else text
 
     def _post(self, method: str, **kwargs) -> dict:
-        resp = requests.post(self.base + method, timeout=120, **kwargs)
+        try:
+            resp = requests.post(self.base + method, timeout=120, **kwargs)
+        except requests.RequestException as exc:
+            # from None: исходное исключение в traceback снова содержало бы URL с токеном
+            raise RuntimeError(
+                f"Telegram API {method}: сеть недоступна ({self._redact(str(exc))})"
+            ) from None
         if resp.status_code != 200:
             # Тело ответа Telegram — единственное место с причиной ошибки (400/413/…)
             raise RuntimeError(
@@ -360,20 +378,44 @@ class Telegram:
                 # Bot API ожидает JSON-строку, а не повторяющийся параметр
                 "allowed_updates": json.dumps(["message"]),
             }, timeout=timeout + 15)
-            if resp.status_code != 200:
-                log.warning("getUpdates HTTP %s: %s", resp.status_code, resp.text[:300])
-            resp.raise_for_status()
-            payload = resp.json()
-            if not payload.get("ok"):
-                return []
-            updates = payload["result"]
-            for u in updates:
-                self._offset = u["update_id"] + 1
-            return updates
-        except Exception as exc:
-            log.warning("getUpdates: %s", exc)
+        except requests.RequestException as exc:
+            # ВАЖНО: str(exc) содержит URL с токеном — только через _redact
+            now = time.time()
+            if now - self._last_net_warn >= 60:      # не спамим лог каждые 3 секунды
+                self._last_net_warn = now
+                log.warning("getUpdates: сеть недоступна (%s)", self._redact(str(exc)))
             time.sleep(3)
             return []
+        if resp.status_code == 409:
+            # «terminated by other getUpdates request» = с этим токеном опрашивает
+            # кто-то ещё: VPS, второй сервис, забытый локальный запуск. Пока живы оба,
+            # команды /check и /status будут работать через раз.
+            now = time.time()
+            if now - self._last_conflict_warn >= 600:
+                self._last_conflict_warn = now
+                log.error(
+                    "getUpdates 409 Conflict: обновления забирает ДРУГОЙ экземпляр бота с этим "
+                    "токеном (VPS / второй сервис / локальный запуск). Команды работать не будут, "
+                    "пока работают оба. Остановите лишний экземпляр, например: systemctl stop mailbot"
+                )
+            time.sleep(3)
+            return []
+        if resp.status_code != 200:
+            log.warning("getUpdates HTTP %s: %s", resp.status_code, resp.text[:300])
+            time.sleep(3)
+            return []
+        try:
+            payload = resp.json()
+            if not payload.get("ok"):
+                log.warning("getUpdates: ok=false: %s", resp.text[:300])
+                return []
+            updates = payload["result"]
+        except Exception as exc:
+            log.warning("getUpdates: не разобрал ответ (%s)", self._redact(str(exc)))
+            return []
+        for u in updates:
+            self._offset = u["update_id"] + 1
+        return updates
 
 
 _RU_MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня",
