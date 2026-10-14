@@ -23,7 +23,9 @@ import io
 import json
 import logging
 import os
+import random
 import re
+import socket
 import ssl
 import threading
 import time
@@ -313,6 +315,8 @@ class Telegram:
         self._offset = 0
         self._last_conflict_warn = 0.0
         self._last_net_warn = 0.0
+        self._started = time.time()
+        self.conflict_count = 0
 
     def _redact(self, text: str) -> str:
         """Вычистить токен из текста перед записью в лог.
@@ -387,18 +391,31 @@ class Telegram:
             time.sleep(3)
             return []
         if resp.status_code == 409:
-            # «terminated by other getUpdates request» = с этим токеном опрашивает
-            # кто-то ещё: VPS, второй сервис, забытый локальный запуск. Пока живы оба,
-            # команды /check и /status будут работать через раз.
+            # «terminated by other getUpdates request» = прямо сейчас обновления
+            # забирает кто-то ещё с этим токеном. Два типичных случая:
+            #  1) деплой на Render: новый контейнер поднялся, старый ещё ~10 с жив
+            #     и продолжает long-poll — само пройдёт, когда Render погасит старый;
+            #  2) настоящий второй экземпляр (VPS/Koyeb/локальный запуск) — тогда
+            #     это будет повторяться и через несколько минут аптайма.
+            self.conflict_count += 1
             now = time.time()
+            uptime = now - self._started
             if now - self._last_conflict_warn >= 600:
                 self._last_conflict_warn = now
-                log.error(
-                    "getUpdates 409 Conflict: обновления забирает ДРУГОЙ экземпляр бота с этим "
-                    "токеном (VPS / второй сервис / локальный запуск). Команды работать не будут, "
-                    "пока работают оба. Остановите лишний экземпляр, например: systemctl stop mailbot"
-                )
-            time.sleep(3)
+                if uptime < 180:
+                    log.warning(
+                        "getUpdates 409: похоже на наложение старого и нового контейнера "
+                        "при деплое (аптайм %.0f с). Если конфликт повторится позже — "
+                        "с этим токеном работает второй экземпляр",
+                        uptime,
+                    )
+                else:
+                    log.error(
+                        "getUpdates 409 Conflict: обновления забирает ДРУГОЙ экземпляр бота с этим "
+                        "токеном (VPS / второй сервис / локальный запуск). Команды работать не будут, "
+                        "пока работают оба. Остановите лишний экземпляр, например: systemctl stop mailbot"
+                    )
+            time.sleep(5)
             return []
         if resp.status_code != 200:
             log.warning("getUpdates HTTP %s: %s", resp.status_code, resp.text[:300])
@@ -445,6 +462,20 @@ def format_date(raw: str) -> str:
         return raw
 
 
+def format_uptime(seconds: float) -> str:
+    total = int(max(0, seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days} д {hours} ч"
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    if minutes:
+        return f"{minutes} мин {secs} с"
+    return f"{secs} с"
+
+
 def split_text(text: str, limit: int) -> list[str]:
     """Резать текст на части ≤ limit БЕЗ потери символов и без пустых частей.
 
@@ -487,6 +518,9 @@ class Bot:
         self.last_result: str = "—"
         self.total_delivered = 0
         self._last_error_notify = 0.0
+        self.started_at = time.time()
+        self.instance = f"{socket.gethostname()}:{os.getpid()}"
+        self._last_conflict_alert = 0.0
 
     # ---- main check ----------------------------------------------------
     def check_mail(self, reason: str) -> None:
@@ -604,6 +638,47 @@ class Bot:
                 continue
             self.tg.send_document(att.filename, att.data, att.mime)
 
+    def status_text(self) -> str:
+        conflicts = self.tg.conflict_count
+        return (
+            "📊 <b>Статус бота</b>\n\n"
+            f"🖥 Экземпляр: <code>{h(self.instance)}</code>, "
+            f"аптайм {format_uptime(time.time() - self.started_at)}\n"
+            f"⏱ Последняя проверка (МСК): <i>{self.last_check}</i>\n"
+            f"📬 Результат: {h(str(self.last_result))}\n"
+            f"📤 Всего отправлено писем: <b>{self.total_delivered}</b>\n"
+            f"⚠️ 409-конфликтов: <b>{conflicts}</b>"
+            + (" — обновления забирает второй экземпляр!" if conflicts else "")
+            + f"\n🔁 Интервал проверки: <b>{self.cfg.check_interval}</b> с"
+        )
+
+    def _maybe_alert_conflicts(self) -> None:
+        """Повторяющиеся 409 — значит, с этим токеном реально работает второй
+        экземпляр. Предупреждаем в чат, но не чаще раза в 6 часов и только если
+        конфликты идут уже дольше трёх минут аптайма (наложение при деплое
+        укладывается в первые секунды и сообщение не заслуживает)."""
+        n = self.tg.conflict_count
+        if n < 3:
+            return
+        now = time.time()
+        if now - self.started_at < 180:
+            return
+        if self._last_conflict_alert and now - self._last_conflict_alert < 21600:
+            return
+        self._last_conflict_alert = now
+        try:
+            self.tg.send_text(
+                f"⚠️ <b>Конфликт обновлений (409)</b>: уже {n} раз.\n\n"
+                "С этим токеном одновременно опрашивает Telegram второй экземпляр бота "
+                "(VPS, другой хостинг или локальный запуск) — команды и письма будут "
+                "приходить через раз или дублироваться.\n\n"
+                "Остановите лишний экземпляр, например: <code>systemctl stop mailbot</code> "
+                "на VPS, либо удалите второй сервис в панели хостинга.",
+                html=True,
+            )
+        except Exception:
+            log.exception(" Не удалось предупредить о конфликте 409")
+
     def _handle_error(self, msg: str) -> None:
         log.error(msg)
         self.last_result = msg
@@ -636,7 +711,9 @@ class Bot:
         )
         log.info("Бот запущен. Интервал: %s с. Ожидание команд…", self.cfg.check_interval)
         while not self._stop.is_set():
-            for upd in self.tg.get_updates(timeout=30):
+            updates = self.tg.get_updates(timeout=30)
+            self._maybe_alert_conflicts()
+            for upd in updates:
                 msg = upd.get("message") or {}
                 chat_id = str((msg.get("chat") or {}).get("id", ""))
                 text = (msg.get("text") or "").strip()
@@ -649,14 +726,7 @@ class Bot:
                     self.tg.send_text("🔍 <b>Проверяю почту…</b>", html=True)
                     self.check_mail("manual")
                 elif text == "/status":
-                    self.tg.send_text(
-                        "📊 <b>Статус бота</b>\n\n"
-                        f"⏱ Последняя проверка (МСК): <i>{self.last_check}</i>\n"
-                        f"📬 Результат: {h(str(self.last_result))}\n"
-                        f"📤 Всего отправлено писем: <b>{self.total_delivered}</b>\n"
-                        f"🔁 Интервал проверки: <b>{self.cfg.check_interval}</b> с",
-                        html=True,
-                    )
+                    self.tg.send_text(self.status_text(), html=True)
                 elif text:
                     self.tg.send_text("❓ Неизвестная команда. Нажмите /help — список команд.")
 
@@ -668,8 +738,16 @@ class Bot:
         except Exception as exc:
             raise SystemExit(f"[tg] Не удалось подключиться к Telegram: {exc}")
 
+        # При деплое Render поднимает новый контейнер, пока старый ещё ~10 с жив и
+        # продолжает опрашивать Telegram и почту. Если начать сразу: экземпляры пинают
+        # друг друга (409), а письмо, пришедшее в эти секунды, может уйти дважды.
+        # Небольшая пауза даёт старому контейнеру умереть до нашего первого действия
+        # (health-сервер уже слушает, так что Render не считает деплой зависшим).
+        delay = random.uniform(8.0, 15.0)
+        log.info("Первый опрос Telegram и проверка почты — через %.0f с", delay)
+        time.sleep(delay)
+
         threading.Thread(target=self.timer_loop, name="timer", daemon=True).start()
-        # первая проверка сразу при старте
         threading.Thread(target=self.check_mail, args=("startup",), daemon=True).start()
         try:
             self.telegram_loop()
@@ -697,8 +775,6 @@ def start_health_server(cfg: Config | None = None) -> None:
     diag_key = os.environ.get("DIAG_KEY", "").strip()
 
     def imap_reachability() -> str:
-        import socket
-
         host = cfg.imap_host if cfg else "(IMAP_HOST не задан)"
         imap_port = cfg.imap_port if cfg else 993
         lines = [f"Хост: {host}:{imap_port}"]

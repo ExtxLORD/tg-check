@@ -2,6 +2,7 @@
 """Static verification: bot.py must contain no mail-mutating or sending code paths."""
 import re
 import sys
+import time
 import warnings
 
 warnings.simplefilter("error", SyntaxWarning)
@@ -138,9 +139,11 @@ class _Capture(_logging.Handler):
     def __init__(self):
         super().__init__()
         self.msgs = []
+        self.levels = []
 
     def emit(self, rec):
         self.msgs.append(rec.getMessage())
+        self.levels.append(rec.levelname)
 
 
 _cap = _Capture()
@@ -159,24 +162,65 @@ except RuntimeError as exc:
 finally:
     b.requests.post = _orig_post
 
-# 409 Conflict: понятное сообщение про второй экземпляр, без токена, с троттлингом
+# 409 Conflict: разбираем два случая — наложение при деплое и реальный второй экземпляр
 _orig_get, _orig_sleep = b.requests.get, b.time.sleep
 b.requests.get = lambda *a, **k: _FakeResp(409, '{"ok":false,"error_code":409,"description":'
                                                '"Conflict: terminated by other getUpdates request; '
                                                'make sure that only one bot instance is running"}')
 b.time.sleep = lambda s: None
 try:
-    _cap.msgs.clear()
+    # случай 1: конфликт случился сразу после старта -> это наложение при деплое
+    _cap.msgs.clear(); _cap.levels.clear()
+    _sec.tg._started = time.time()
+    _sec.tg._last_conflict_warn = 0.0
+    _sec.tg.conflict_count = 0
     _sec.tg.get_updates(timeout=1)
     _sec.tg.get_updates(timeout=1)      # внутри окна троттлинга — второго лога быть не должно
+    _s409 = [m for m in _cap.msgs if "409" in m]
+    check("409 сразу после старта: warning про наложение при деплое",
+          len(_s409) == 1 and _cap.levels[0] == "WARNING" and "наложение" in _s409[0].lower(),
+          f"{_cap.levels[:1]} {(_s409[:1] or [''])[0][:60]}")
+
+    # случай 2: конфликт при большом аптайме -> это настоящий второй экземпляр
+    _cap.msgs.clear(); _cap.levels.clear()
+    _sec.tg._started = time.time() - 400
+    _sec.tg._last_conflict_warn = 0.0
+    _sec.tg.get_updates(timeout=1)
+    _s409 = [m for m in _cap.msgs if "ДРУГОЙ экземпляр" in m]
+    check("409 при долгом аптайме: ERROR про второй экземпляр",
+          len(_s409) == 1 and _cap.levels[0] == "ERROR", _cap.levels[:1])
+    check("409: счётчик конфликтов растёт", _sec.tg.conflict_count > 0, str(_sec.tg.conflict_count))
 finally:
     b.requests.get, b.time.sleep = _orig_get, _orig_sleep
-b.log.removeHandler(_cap)
 
-_conflict_logs = [m for m in _cap.msgs if "ДРУГОЙ экземпляр" in m]
-check("409: понятное сообщение про второй экземпляр", len(_conflict_logs) >= 1)
-check("409: троттлинг (одно сообщение на окно)", len(_conflict_logs) == 1, f"сообщений: {len(_conflict_logs)}")
 check("логи без токена", all(_TOKEN not in m for m in _cap.msgs), str([m[:60] for m in _cap.msgs]))
+
+# предупреждение о конфликте уходит в чат только при настоящей проблеме
+_alerts = []
+_sec.tg.send_text = lambda text, html=False: _alerts.append(text)
+
+_sec.tg.conflict_count = 9
+_sec.started_at = time.time()          # свежий старт — не пугаем пользователя
+_sec._last_conflict_alert = 0.0
+_sec._maybe_alert_conflicts()
+check("409 в первые минуты: чат не пугаем", not _alerts)
+
+_sec.started_at = time.time() - 400    # аптайм > 3 минут — конфликт систематический
+_sec._maybe_alert_conflicts()
+_sec._maybe_alert_conflicts()          # повторно — не раньше чем через 6 часов
+check("409 при долгом аптайме: одно предупреждение в чат", len(_alerts) == 1, f"сообщений: {len(_alerts)}")
+check("409-предупреждение объясняет причину",
+      bool(_alerts) and "второй экземпляр" in _alerts[0].lower() and "409" in _alerts[0])
+
+# /status: экземпляр, аптайм, счётчик конфликтов
+_st = _sec.status_text()
+check("status: показывает экземпляр и аптайм", _sec.instance in _st and "аптайм" in _st, _st.splitlines()[2][:70])
+check("status: показывает счётчик 409 и предупреждение",
+      "409-конфликтов: <b>9</b>" in _st and "второй экземпляр" in _st.lower())
+check("format_uptime", b.format_uptime(59) == "59 с" and "мин" in b.format_uptime(120)
+      and "ч" in b.format_uptime(7300) and "д" in b.format_uptime(90000))
+
+b.log.removeHandler(_cap)
 
 # ---------------------------------------------------------------------------
 # /diag — проверка доступности IMAP с самого хостинга (диагностика на PaaS)
