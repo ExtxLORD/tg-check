@@ -521,6 +521,8 @@ class Bot:
         self.started_at = time.time()
         self.instance = f"{socket.gethostname()}:{os.getpid()}"
         self._last_conflict_alert = 0.0
+        self._consecutive_failures = 0
+        self._auto_pause_until = 0.0
 
     # ---- main check ----------------------------------------------------
     def check_mail(self, reason: str) -> None:
@@ -539,6 +541,9 @@ class Bot:
             try:
                 client = imap_connect(self.cfg)
                 mails = imap_fetch_unseen(client)
+                # соединение и чтение прошли — сбрасываем автопаузу после сбоев
+                self._consecutive_failures = 0
+                self._auto_pause_until = 0.0
                 self.last_check = datetime.now(_MSK).strftime("%Y-%m-%d %H:%M:%S")
 
                 pending = [m for m in mails if m.uid not in self._processed]
@@ -640,6 +645,13 @@ class Bot:
 
     def status_text(self) -> str:
         conflicts = self.tg.conflict_count
+        pause = ""
+        if not self._auto_check_allowed():
+            left = int(max(0.0, self._auto_pause_until - time.time()) / 60) + 1
+            pause = (
+                f"\n⏸ Автопроверки на паузе ещё ~{left} мин "
+                f"(сбоев подряд: {self._consecutive_failures}) — жмите /check вручную"
+            )
         return (
             "📊 <b>Статус бота</b>\n\n"
             f"🖥 Экземпляр: <code>{h(self.instance)}</code>, "
@@ -649,6 +661,7 @@ class Bot:
             f"📤 Всего отправлено писем: <b>{self.total_delivered}</b>\n"
             f"⚠️ 409-конфликтов: <b>{conflicts}</b>"
             + (" — обновления забирает второй экземпляр!" if conflicts else "")
+            + pause
             + f"\n🔁 Интервал проверки: <b>{self.cfg.check_interval}</b> с"
         )
 
@@ -682,6 +695,19 @@ class Bot:
     def _handle_error(self, msg: str) -> None:
         log.error(msg)
         self.last_result = msg
+        # Повторяющиеся сбои IMAP — почти всегда «сервер почты нас не пускает»
+        # (блокировка облачного IP антиспамом Mail.ru и т.п.). Продолжать долбить
+        # его каждые CHECK_INTERVAL секунд бессмысленно и только продлевает
+        # блокировку, поэтому автопроверки постепенно уходят в паузу до 30 минут.
+        # Ручной /check паузу игнорирует — пользователь решает сам.
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= 2:
+            extra = min(120.0 * (2 ** (self._consecutive_failures - 2)), 1800.0)
+            self._auto_pause_until = time.time() + extra
+            log.warning(
+                "Сбоев подряд: %d — автопроверки на паузе %.0f с (ручной /check работает)",
+                self._consecutive_failures, extra,
+            )
         now = time.time()
         if now - self._last_error_notify > 1800:   # не спамим в чат чаще раза в 30 мин
             self._last_error_notify = now
@@ -691,11 +717,22 @@ class Bot:
                 log.exception("Не удалось уведомить о проблеме")
 
     # ---- threads -------------------------------------------------------
+    def _auto_check_allowed(self) -> bool:
+        """Не запускать таймерную проверку, пока идёт автопауза после сбоев."""
+        return time.time() >= self._auto_pause_until
+
     def timer_loop(self) -> None:
         while not self._stop.is_set():
             self._stop.wait(self.cfg.check_interval)
             if self._stop.is_set():
                 break
+            if not self._auto_check_allowed():
+                left = self._auto_pause_until - time.time()
+                log.info(
+                    "Автопроверка на паузе ещё %.0f с (сбоев подряд: %d)",
+                    max(0.0, left), self._consecutive_failures,
+                )
+                continue
             self.check_mail("timer")
 
     def telegram_loop(self) -> None:

@@ -223,6 +223,36 @@ check("format_uptime", b.format_uptime(59) == "59 с" and "мин" in b.format_u
 b.log.removeHandler(_cap)
 
 # ---------------------------------------------------------------------------
+# Автопауза при повторных сбоях IMAP: не «долбить» почтовый сервер
+# (Mail.ru блокирует облачные IP за частые подключения — 30-секундный интервал усугубляет)
+_pb = b.Bot(b.Config(imap_host="h", imap_port=993, mail_login="l", mail_password="p",
+                     tg_token="t", tg_chat_id="1", check_interval=300, imap_folder="INBOX",
+                     max_per_check=25, max_attachment_mb=50))
+_pb.tg.send_text = lambda text, html=False: None
+_orig = (b.imap_connect, b.imap_fetch_unseen, b.imap_release)
+b.imap_connect = lambda cfg: (_ for _ in ()).throw(TimeoutError("timed out"))
+try:
+    _pb.check_mail("timer")
+    check("IMAP-сбой #1: автопаузы ещё нет", _pb._auto_check_allowed() and _pb._consecutive_failures == 1)
+    _pb.check_mail("timer")
+    check("IMAP-сбой #2: автопауза включилась", not _pb._auto_check_allowed())
+    _pb.check_mail("timer")
+    _pb.check_mail("timer")
+    check("IMAP-сбой #4: пауза растёт, но ≤ 30 минут",
+          0 < _pb._auto_pause_until - time.time() <= 1800, f"{_pb._auto_pause_until - time.time():.0f} с")
+    check("status: показывает автопаузу", "на паузе" in _pb.status_text())
+
+    # успешная проверка сбрасывает счётчик и паузу
+    b.imap_connect = lambda cfg: "FAKE"
+    b.imap_fetch_unseen = lambda c: []
+    b.imap_release = lambda c: None
+    _pb.check_mail("timer")
+    check("успешная проверка сбрасывает счётчик и паузу",
+          _pb._consecutive_failures == 0 and _pb._auto_check_allowed())
+finally:
+    b.imap_connect, b.imap_fetch_unseen, b.imap_release = _orig
+
+# ---------------------------------------------------------------------------
 # /diag — проверка доступности IMAP с самого хостинга (диагностика на PaaS)
 import os as _os
 import urllib.request as _url
