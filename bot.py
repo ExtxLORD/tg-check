@@ -285,26 +285,89 @@ def _part_text(part: Message) -> str:
 # ------------------------------------------------------------ IMAP layer
 # READ-ONLY: search + peek-fetch. The single write op is mark_seen().
 
+_PASSWORD_OK: dict[str, str] = {}   # login -> вариант пароля, который сервер принял
+
+_APP_PW_HINT = (
+    "нужен «пароль для внешних приложений» Mail.ru — обычный пароль от ящика "
+    "IMAP не принимает. Создайте его: почта Mail.ru → Настройки → Все настройки → "
+    "Безопасность → «Пароли для внешних приложений» → Создать (к аккаунту должен "
+    "быть привязан телефон; выберите доступ к Почте для почтовой программы). "
+    "Полученный пароль вставьте в MAIL_PASSWORD и перезапустите сервис. "
+    "Инструкция Mail.ru: https://help.mail.ru/mail/security/protection/external"
+)
+
+
+def human_imap_error(exc: Exception | str | None) -> str:
+    """Читаемое объяснение вместо сырого b'[AUTHENTICATIONFAILED] NEOBHODIM ...'."""
+    raw = str(exc)
+    m = re.search(r"b'([^']*)'", raw)
+    if m:
+        raw = m.group(1)
+    raw = raw.replace("\\n", " ").replace("\\r", " ").strip()
+    up = raw.upper()
+    if ("AUTHENTICATIONFAILED" in up or "NEOBHODIM PAROL" in up
+            or "APPLICATION PASSWORD IS REQUIRED" in up or "LOGIN FAILED" in up):
+        return "сервер отклонил логин: " + _APP_PW_HINT
+    if "TIMED OUT" in up or "TIMEOUT" in up:
+        return ("сервер почты не отвечает (таймаут соединения) — вероятна блокировка "
+                "облачного IP почтовым сервисом; проверьте доступность через /diag")
+    if "GETADDRINFO" in up or "LOOKUP" in up or "NO ADDRESS" in up:
+        return f"не удалось разрешить имя сервера почты: {raw[:200]}"
+    return (raw or str(exc))[:300]
+
+
+def _password_variants(cfg: Config) -> list[str]:
+    """Варианты пароля для попытки логина.
+
+    Mail.ru показывает «пароль для внешних приложений» группами с пробелами;
+    если скопировать его вместе с ними (или с кавычками), сервер отвечает
+    AUTHENTICATIONFAILED. Пробуем исходный вариант и очищенный, а если один из
+    них уже срабатывал в этом процессе — начинаем с него.
+    """
+    base = cfg.mail_password
+    variants: list[str] = []
+    for candidate in (base, base.replace(" ", ""), base.strip().strip('"').strip("'")):
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    known = _PASSWORD_OK.get(cfg.mail_login)
+    if known and known in variants:
+        variants.remove(known)
+        variants.insert(0, known)
+    return variants
+
 def imap_connect(cfg: Config, attempts: int = 2) -> imaplib.IMAP4_SSL:
     """Одно соединение на проверку: fetch + mark_seen на одном клиенте.
 
     SELECT открывается на запись — иначе сервер запретит ЕДИНСТВЕННУЮ
     операцию записи в боте (STORE +FLAGS \\Seen после доставки).
     Чтение при этом остаётся без побочных эффектов: BODY.PEEK[] не ставит \\Seen.
+
+    Отказ авторизации не повторяем (сервер уже сказал, что пароль не тот —
+    лишние попытки только злят антиспам почтовика), сетевые сбои — повторяем.
     """
     ctx = ssl.create_default_context()
     last_exc: Exception | None = None
     for attempt in range(attempts):
-        try:
-            client = imaplib.IMAP4_SSL(cfg.imap_host, cfg.imap_port, ssl_context=ctx, timeout=30)
-            client.login(cfg.mail_login, cfg.mail_password)
-            client.select(cfg.imap_folder)
-            return client
-        except Exception as exc:  # noqa: BLE001 — любой сбой сети/логина повторяем один раз
-            last_exc = exc
-            if attempt + 1 < attempts:
-                log.warning("IMAP connect failed (%s), повтор через 4 с…", exc)
-                time.sleep(4)
+        auth_rejected = False
+        for password in _password_variants(cfg):
+            try:
+                client = imaplib.IMAP4_SSL(cfg.imap_host, cfg.imap_port, ssl_context=ctx, timeout=30)
+                client.login(cfg.mail_login, password)
+                client.select(cfg.imap_folder)
+                _PASSWORD_OK[cfg.mail_login] = password
+                return client
+            except imaplib.IMAP4.error as exc:
+                auth_rejected = True
+                last_exc = exc
+                log.warning("IMAP: логин отклонён — %s", human_imap_error(exc))
+            except Exception as exc:  # noqa: BLE001 — сеть/SSL: есть смысл повторить
+                last_exc = exc
+                break
+        if auth_rejected:
+            raise last_exc if last_exc else RuntimeError("IMAP login failed")
+        if attempt + 1 < attempts:
+            log.warning("IMAP connect failed (%s), повтор через 4 с…", human_imap_error(last_exc))
+            time.sleep(4)
     raise last_exc if last_exc else RuntimeError("IMAP connect failed")
 
 
@@ -594,6 +657,7 @@ class Bot:
         self._last_conflict_alert = 0.0
         self._consecutive_failures = 0
         self._auto_pause_until = 0.0
+        self._last_auth_notify = 0.0
 
     # ---- main check ----------------------------------------------------
     def _mark_processed(self, uid: str) -> None:
@@ -667,9 +731,9 @@ class Bot:
             finally:
                 imap_release(client)
         except imaplib.IMAP4.error as exc:
-            self._handle_error(f"IMAP ошибка: {exc}")
+            self._handle_error(f"Почта: {human_imap_error(exc)}")
         except Exception as exc:
-            self._handle_error(f"Ошибка проверки: {exc}")
+            self._handle_error(f"Ошибка проверки: {human_imap_error(exc)}")
         finally:
             self._lock.release()
 
@@ -789,8 +853,17 @@ class Bot:
                 self._consecutive_failures, extra,
             )
         now = time.time()
-        if now - self._last_error_notify > 1800:   # не спамим в чат чаще раза в 30 мин
-            self._last_error_notify = now
+        # Отказ авторизации требует действий человека (создать пароль для
+        # приложений), поэтому напоминаем о нём раз в 6 часов, а не каждые
+        # полчаса. Сетевые сбои — как раньше, раз в 30 минут.
+        auth_problem = ("внешних приложений" in msg) or ("AUTHENTICATIONFAILED" in msg.upper())
+        window = 21600 if auth_problem else 1800
+        stamp = self._last_auth_notify if auth_problem else self._last_error_notify
+        if now - stamp > window:
+            if auth_problem:
+                self._last_auth_notify = now
+            else:
+                self._last_error_notify = now
             try:
                 self.tg.send_text(f"⚠️ Проблема с проверкой почты:\n{msg}")
             except Exception:
@@ -937,6 +1010,25 @@ def start_health_server(cfg: Config | None = None) -> None:
                 )
         return "\n".join(lines)
 
+    def imap_login_test() -> str:
+        """Проверка логина/пароля изнутри контейнера (без Shell на хостинге).
+        Тратит одну попытку логина — вызывается только по /diag?login=1."""
+        if cfg is None:
+            return "IMAP не настроен (нет конфигурации)"
+        try:
+            client = imaplib.IMAP4_SSL(cfg.imap_host, cfg.imap_port,
+                                       ssl_context=ssl.create_default_context(), timeout=20)
+        except Exception as exc:
+            return f"Соединение: FAIL — {human_imap_error(exc)}"
+        try:
+            client.login(cfg.mail_login, cfg.mail_password)
+            typ, _ = client.select(cfg.imap_folder)
+            return f"LOGIN {cfg.mail_login}: OK — папка {cfg.imap_folder} доступна ({typ})"
+        except Exception as exc:
+            return f"LOGIN {cfg.mail_login}: FAIL — {human_imap_error(exc)}"
+        finally:
+            imap_release(client)
+
     class _HealthHandler(BaseHTTPRequestHandler):
         def _send(self, code: int, body: bytes) -> None:
             self.send_response(code)
@@ -948,10 +1040,14 @@ def start_health_server(cfg: Config | None = None) -> None:
         def do_GET(self):  # noqa: N802
             parts = urlsplit(self.path)
             if parts.path.rstrip("/") == "/diag":
-                if diag_key and parse_qs(parts.query).get("key", [""])[0] != diag_key:
+                qs = parse_qs(parts.query)
+                if diag_key and qs.get("key", [""])[0] != diag_key:
                     self._send(403, b"forbidden: otkroite /diag?key=DIAG_KEY")
                     return
-                self._send(200, imap_reachability().encode("utf-8"))
+                report = imap_reachability()
+                if qs.get("login", [""])[0] == "1":
+                    report += "\n\nПроверка входа (тратит одну попытку логина):\n" + imap_login_test()
+                self._send(200, report.encode("utf-8"))
                 return
             self._send(200, b"ok")
 

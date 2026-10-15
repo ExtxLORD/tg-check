@@ -274,6 +274,98 @@ check("format_uptime", b.format_uptime(59) == "59 с" and "мин" in b.format_u
 b.log.removeHandler(_cap)
 
 # ---------------------------------------------------------------------------
+# Понятные ошибки IMAP вместо сырых b'[AUTHENTICATIONFAILED] NEOBHODIM ...'
+_auth_raw = ("b'[AUTHENTICATIONFAILED] NEOBHODIM parol prilozheniya "
+             "https://help.mail.ru/mail/security/protection/external / "
+             "Application password is REQUIRED'")
+_h = b.human_imap_error(_auth_raw)
+check("ошибка логина: человеческий текст про пароль приложений",
+      "внешних приложений" in _h and "b'" not in _h and "help.mail.ru" in _h, _h[:60])
+check("ошибка таймаута: подсказка про /diag",
+      "таймаут" in b.human_imap_error("socket timed out") and "/diag" in b.human_imap_error("socket timed out"))
+check("неизвестная ошибка: сырой текст без мусора",
+      b.human_imap_error("NO Error: something odd") == "NO Error: something odd")
+
+# варианты пароля: пробелы и кавычки в пароле приложений Mail.ru
+_cv = b.Config(imap_host="h", imap_port=993, mail_login="l", mail_password="abcd efgh",
+               tg_token="t", tg_chat_id="1", check_interval=300, imap_folder="INBOX",
+               max_per_check=25, max_attachment_mb=50)
+b._PASSWORD_OK.clear()
+check("пароль: вариант без пробелов добавлен", b._password_variants(_cv) == ["abcd efgh", "abcdefgh"],
+      str(b._password_variants(_cv)))
+b._PASSWORD_OK["l"] = "abcdefgh"
+check("пароль: сработавший вариант пробуется первым", b._password_variants(_cv)[0] == "abcdefgh")
+_cq = b.Config(imap_host="h", imap_port=993, mail_login="l", mail_password='"secret123"',
+               tg_token="t", tg_chat_id="1", check_interval=300, imap_folder="INBOX",
+               max_per_check=25, max_attachment_mb=50)
+check("пароль: кавычки снимаются", "secret123" in b._password_variants(_cq))
+b._PASSWORD_OK.clear()
+
+# imap_connect: пробует второй вариант пароля и запоминает рабочий
+class _FakeIMAP:
+    logins = []
+    fail_with = "abcd efgh"      # вариант с пробелом сервер отклоняет
+
+    def __init__(self, *a, **k):
+        pass
+
+    def login(self, user, pw):
+        _FakeIMAP.logins.append(pw)
+        if _FakeIMAP.fail_with is None or pw == _FakeIMAP.fail_with:
+            raise b.imaplib.IMAP4.error("[AUTHENTICATIONFAILED] nope")
+        return ("OK", [b"done"])
+
+    def select(self, folder):
+        return ("OK", [b"1"])
+
+    def close(self):
+        pass
+
+    def logout(self):
+        pass
+
+
+_orig_ssl, _orig_sleep2 = b.imaplib.IMAP4_SSL, b.time.sleep
+b.imaplib.IMAP4_SSL = _FakeIMAP
+b.time.sleep = lambda s: None
+try:
+    _FakeIMAP.logins.clear()
+    _client = b.imap_connect(_cv)
+    check("imap_connect: пробует вариант пароля без пробелов",
+          _FakeIMAP.logins == ["abcd efgh", "abcdefgh"], str(_FakeIMAP.logins))
+    check("imap_connect: рабочий вариант закэширован", b._PASSWORD_OK.get("l") == "abcdefgh")
+
+    # отказ авторизации не повторяется по кругу (2 варианта — 2 попытки, без повторов)
+    _FakeIMAP.logins.clear()
+    _FakeIMAP.fail_with = None     # теперь любой пароль отклоняется
+    _slept = []
+    b.time.sleep = lambda s: _slept.append(s)
+    _raised = False
+    try:
+        b.imap_connect(_cv)
+    except Exception:
+        _raised = True
+    check("imap_connect: отказ логина -> сразу исключение", _raised)
+    check("imap_connect: нет бессмысленных повторов логина",
+          len(_FakeIMAP.logins) == 2 and not _slept, f"попыток {len(_FakeIMAP.logins)}, пауз {_slept}")
+finally:
+    b.imaplib.IMAP4_SSL, b.time.sleep = _orig_ssl, _orig_sleep2
+    b._PASSWORD_OK.clear()
+
+# уведомление об отказе авторизации — раз в 6 часов, а не каждые 30 минут
+_auth_bot = b.Bot(b.Config(imap_host="h", imap_port=993, mail_login="l", mail_password="p",
+                           tg_token="t", tg_chat_id="1", check_interval=300, imap_folder="INBOX",
+                           max_per_check=25, max_attachment_mb=50))
+_sent_auth = []
+_auth_bot.tg.send_text = lambda text, html=False: _sent_auth.append(text)
+_auth_bot._handle_error("Почта: сервер отклонил логин: нужен «пароль для внешних приложений»")
+_auth_bot._handle_error("Почта: сервер отклонил логин: нужен «пароль для внешних приложений»")
+check("auth-ошибка: не спамит каждую проверку", len(_sent_auth) == 1, f"сообщений {len(_sent_auth)}")
+_auth_bot._last_auth_notify = time.time() - 21600 - 1
+_auth_bot._handle_error("Почта: сервер отклонил логин: нужен «пароль для внешних приложений»")
+check("auth-ошибка: напоминание через 6 часов", len(_sent_auth) == 2, f"сообщений {len(_sent_auth)}")
+
+# ---------------------------------------------------------------------------
 # История доставленных uid не растёт бесконечно
 _h = b.Bot(b.Config(imap_host="h", imap_port=993, mail_login="l", mail_password="p",
                     tg_token="t", tg_chat_id="1", check_interval=300, imap_folder="INBOX",
@@ -336,6 +428,60 @@ finally:
 check("health: / отвечает ok", _root_body == "ok", _root_body[:30])
 check("diag: показывает DNS и результат TCP", "DNS:" in _diag_body and "TCP" in _diag_body)
 check("diag: закрытый порт виден как FAIL", "FAIL" in _diag_body, _diag_body.replace("\n", " | ")[:110])
+check("diag: без login=1 вход не проверяется", "LOGIN" not in _diag_body)
+
+# /diag?login=1 на фейковом IMAP: успех и отказ авторизации
+class _FakeIMAPDiag:
+    password = "good"
+
+    def __init__(self, *a, **k):
+        pass
+
+    def login(self, user, pw):
+        if pw != _FakeIMAPDiag.password:
+            raise b.imaplib.IMAP4.error("[AUTHENTICATIONFAILED] NEOBHODIM parol prilozheniya")
+        return ("OK", [b"ok"])
+
+    def select(self, folder):
+        return ("OK", [b"1"])
+
+    def close(self):
+        pass
+
+    def logout(self):
+        pass
+
+
+_orig_ssl3 = b.imaplib.IMAP4_SSL
+b.imaplib.IMAP4_SSL = _FakeIMAPDiag
+try:
+    _diag_ok_cfg = b.Config(imap_host="imap.mail.ru", imap_port=993, mail_login="2609216@edu.fa.ru",
+                            mail_password="good", tg_token="t", tg_chat_id="1", check_interval=300,
+                            imap_folder="INBOX", max_per_check=25, max_attachment_mb=50)
+    _os.environ["PORT"] = "18100"
+    try:
+        b.start_health_server(_diag_ok_cfg)
+        _login_ok = _url.urlopen("http://127.0.0.1:18100/diag?login=1", timeout=30).read().decode()
+    finally:
+        _os.environ.pop("PORT", None)
+    check("diag?login=1: успешный вход показан как OK",
+          "LOGIN" in _login_ok and "OK" in _login_ok and "2609216@edu.fa.ru" in _login_ok,
+          _login_ok.replace("\n", " | ")[-80:])
+
+    _FakeIMAPDiag.password = "good"    # остальным вариантам пароля тоже откажем
+    _diag_bad_cfg = b.Config(imap_host="imap.mail.ru", imap_port=993, mail_login="2609216@edu.fa.ru",
+                             mail_password="wrong", tg_token="t", tg_chat_id="1", check_interval=300,
+                             imap_folder="INBOX", max_per_check=25, max_attachment_mb=50)
+    _os.environ["PORT"] = "18101"
+    try:
+        b.start_health_server(_diag_bad_cfg)
+        _login_bad = _url.urlopen("http://127.0.0.1:18101/diag?login=1", timeout=30).read().decode()
+    finally:
+        _os.environ.pop("PORT", None)
+    check("diag?login=1: отказ логина -> подсказка про пароль приложений",
+          "внешних приложений" in _login_bad, _login_bad.replace("\n", " | ")[-90:])
+finally:
+    b.imaplib.IMAP4_SSL = _orig_ssl3
 
 print()
 print("ALL PASSED" if not fails else f"FAILURES: {fails}")
